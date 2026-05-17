@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 import yt_dlp
 import os
 import uuid
@@ -6,8 +6,8 @@ import requests
 import hashlib
 import glob
 import shutil
-from pyngrok import ngrok
-
+import json
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -30,7 +30,7 @@ os.makedirs(CACHE_VIDEO_DIR, exist_ok=True)
 MAX_CACHE_SIZE = 500 * 1024 * 1024  # 500MB
 
 # Path to your cookies file (if needed)
-COOKIES_FILE = "cookies.txt"  # Replace with your actual cookies file path if required
+COOKIES_FILE = "cookies.txt"
 
 # Search API URL (used both for regular searches and Spotify link resolution)
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search?title="
@@ -59,6 +59,100 @@ def check_cache_size_and_cleanup():
                     os.remove(file_path)
                 except Exception as e:
                     print(f"Error deleting file {file_path}: {e}")
+
+def get_stream_info(video_url, quality='audio'):
+    """
+    Get direct streaming URL and metadata from YouTube.
+    Returns a dict with streaming URLs, headers, and metadata.
+    """
+    ydl_opts = {
+        'quiet': True,
+        'cookiefile': COOKIES_FILE,
+        'socket_timeout': 60,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(video_url, download=False)
+            
+            if quality == 'audio':
+                # Get best audio format
+                formats = info.get('formats', [])
+                audio_formats = []
+                
+                for f in formats:
+                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                        # Prioritize m4a over webm for better compatibility
+                        ext = f.get('ext', '')
+                        abr = f.get('abr', 0)
+                        audio_formats.append({
+                            'url': f.get('url'),
+                            'ext': ext,
+                            'abr': abr,
+                            'filesize': f.get('filesize'),
+                            'format_id': f.get('format_id')
+                        })
+                
+                # Sort by bitrate (higher is better) and extension preference
+                audio_formats.sort(key=lambda x: (
+                    x['ext'] != 'm4a',  # m4a preferred
+                    -x.get('abr', 0)     # higher bitrate preferred
+                ))
+                
+                if audio_formats:
+                    stream_data = audio_formats[0]
+                else:
+                    # Fallback: extract from manifest
+                    stream_data = {'url': info.get('url')}
+                
+                return {
+                    'stream_url': stream_data.get('url'),
+                    'format': stream_data.get('ext', 'm4a'),
+                    'bitrate': stream_data.get('abr'),
+                    'title': info.get('title'),
+                    'duration': info.get('duration'),
+                    'thumbnail': info.get('thumbnail'),
+                    'video_id': info.get('id'),
+                    'filesize': stream_data.get('filesize'),
+                    'quality': 'audio'
+                }
+            
+            else:  # video quality - 240p with audio
+                # Get best format with video <= 240p and audio
+                video_formats = []
+                for f in formats:
+                    height = f.get('height') or 0
+                    if height <= 240 and f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+                        video_formats.append({
+                            'url': f.get('url'),
+                            'ext': f.get('ext', 'mp4'),
+                            'height': height,
+                            'filesize': f.get('filesize'),
+                            'format_id': f.get('format_id')
+                        })
+                
+                # Sort by height (higher is better but still <=240)
+                video_formats.sort(key=lambda x: -x['height'])
+                
+                if video_formats:
+                    stream_data = video_formats[0]
+                else:
+                    stream_data = {'url': info.get('url')}
+                
+                return {
+                    'stream_url': stream_data.get('url'),
+                    'format': stream_data.get('ext', 'mp4'),
+                    'height': stream_data.get('height', 240),
+                    'title': info.get('title'),
+                    'duration': info.get('duration'),
+                    'thumbnail': info.get('thumbnail'),
+                    'video_id': info.get('id'),
+                    'filesize': stream_data.get('filesize'),
+                    'quality': 'video'
+                }
+                
+        except Exception as e:
+            raise Exception(f"Error getting stream info: {e}")
 
 def download_audio(video_url):
     """
@@ -89,7 +183,7 @@ def download_audio(video_url):
             ext = info.get("ext", "m4a")
             cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
             shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()  # Check cache size after adding a new file
+            check_cache_size_and_cleanup()
             return cached_file_path
         except Exception as e:
             raise Exception(f"Error downloading audio: {e}")
@@ -164,7 +258,7 @@ def download_video(video_url):
             downloaded_file = ydl.prepare_filename(info)
             cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
             shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()  # Check cache size after adding a new file
+            check_cache_size_and_cleanup()
             return cached_file_path
         except Exception as e:
             raise Exception(f"Error downloading video: {e}")
@@ -204,7 +298,6 @@ def download_video_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        # Clean up temporary download files only (not the caches)
         for file in os.listdir(TEMP_DOWNLOAD_DIR):
             file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
             try:
@@ -248,7 +341,6 @@ def download_audio_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        # Clean up temporary download files only (not the caches)
         for file in os.listdir(TEMP_DOWNLOAD_DIR):
             file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
             try:
@@ -256,33 +348,193 @@ def download_audio_endpoint():
             except Exception as cleanup_error:
                 print(f"Error deleting file {file_path}: {cleanup_error}")
 
+@app.route('/stream', methods=['GET'])
+def stream_endpoint():
+    """
+    Get direct streaming URL/info for real-time playback in Telegram music bot.
+    Returns streaming URLs that can be used directly.
+    
+    Query parameters:
+    - url: YouTube video URL
+    - title: Search by title
+    - quality: 'audio' (default) or 'video'
+    - type: 'info' (return metadata only) or 'url' (return streaming URL)
+    """
+    try:
+        video_url = request.args.get('url')
+        video_title = request.args.get('title')
+        quality = request.args.get('quality', 'audio')
+        resp_type = request.args.get('type', 'info')
+        
+        if not video_url and not video_title:
+            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
+        
+        if video_title and not video_url:
+            response = requests.get(SEARCH_API_URL + video_title)
+            if response.status_code != 200:
+                return jsonify({"error": "Failed to fetch search results"}), 500
+            search_result = response.json()
+            if not search_result or 'link' not in search_result:
+                return jsonify({"error": "No videos found for the given query"}), 404
+            video_url = search_result['link']
+        
+        if video_url and "spotify.com" in video_url:
+            video_url = resolve_spotify_link(video_url)
+        
+        # Get stream information
+        stream_info = get_stream_info(video_url, quality)
+        
+        if resp_type == 'url':
+            # Return just the streaming URL (for direct playback)
+            return jsonify({
+                "stream_url": stream_info['stream_url'],
+                "title": stream_info['title'],
+                "duration": stream_info['duration'],
+                "format": stream_info['format']
+            })
+        else:
+            # Return full metadata with streaming info
+            return jsonify({
+                "status": "success",
+                "stream_url": stream_info['stream_url'],
+                "title": stream_info['title'],
+                "duration": stream_info['duration'],
+                "thumbnail": stream_info.get('thumbnail'),
+                "video_id": stream_info.get('video_id'),
+                "format": stream_info.get('format'),
+                "filesize": stream_info.get('filesize'),
+                "quality": stream_info.get('quality'),
+                "bitrate": stream_info.get('bitrate'),
+                "height": stream_info.get('height'),
+                # Add headers that might be needed for streaming
+                "headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://www.youtube.com/"
+                }
+            })
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/stream/download', methods=['GET'])
+def stream_download_endpoint():
+    """
+    Proxy endpoint that streams the content directly.
+    Useful for when you need to avoid CORS or want to stream through the API.
+    
+    Query parameters:
+    - url: YouTube video URL
+    - title: Search by title
+    - quality: 'audio' (default) or 'video'
+    """
+    try:
+        video_url = request.args.get('url')
+        video_title = request.args.get('title')
+        quality = request.args.get('quality', 'audio')
+        
+        if not video_url and not video_title:
+            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
+        
+        if video_title and not video_url:
+            response = requests.get(SEARCH_API_URL + video_title)
+            if response.status_code != 200:
+                return jsonify({"error": "Failed to fetch search results"}), 500
+            search_result = response.json()
+            if not search_result or 'link' not in search_result:
+                return jsonify({"error": "No videos found for the given query"}), 404
+            video_url = search_result['link']
+        
+        if video_url and "spotify.com" in video_url:
+            video_url = resolve_spotify_link(video_url)
+        
+        stream_info = get_stream_info(video_url, quality)
+        stream_url = stream_info['stream_url']
+        
+        # Stream the content from YouTube
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.youtube.com/',
+        }
+        
+        def generate():
+            with requests.get(stream_url, headers=headers, stream=True) as r:
+                r.raise_for_status()
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+        
+        content_type = 'audio/mp4' if quality == 'audio' else 'video/mp4'
+        return Response(
+            stream_with_context(generate()),
+            headers={
+                'Content-Type': content_type,
+                'Content-Disposition': f'inline; filename="{stream_info["title"]}.{stream_info["format"]}"'
+            }
+        )
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/')
 def home():
     return """
-    <h1>🎶 YouTube Audio Downloader API</h1>
-    <p>Use this API to search and download audio from YouTube videos.</p>
-    <p><strong>Endpoints:</strong></p>
+    <h1>🎵 YouTube Audio/Video Downloader & Streaming API</h1>
+    <p>Use this API to search, download, and stream audio/video from YouTube.</p>
+    
+    <h2>📡 Endpoints:</h2>
     <ul>
-        <li><strong>/search</strong>: Search for a video by title. Query parameter: <code>?title=</code></li>
-        <li><strong>/download</strong>: Download audio by URL or search for a title and download. Query parameters: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/vdown</strong>: Download video (240p + worst audio) by URL or search for a title and download.</li>
+        <li><strong>GET /search</strong> - Search for a video by title<br>
+            <code>?title=query</code></li>
+        <li><strong>GET /download</strong> - Download audio by URL or title<br>
+            <code>?url=URL</code> or <code>?title=query</code></li>
+        <li><strong>GET /vdown</strong> - Download video (240p) by URL or title<br>
+            <code>?url=URL</code> or <code>?title=query</code></li>
+        <li><strong>GET /stream</strong> - Get streaming URL/info for real-time playback ⭐ NEW<br>
+            <code>?url=URL</code> or <code>?title=query</code><br>
+            Optional: <code>&quality=audio|video</code> | <code>&type=info|url</code></li>
+        <li><strong>GET /stream/download</strong> - Direct proxy streaming endpoint ⭐ NEW<br>
+            <code>?url=URL</code> or <code>?title=query</code><br>
+            Optional: <code>&quality=audio|video</code></li>
     </ul>
-    <p>Examples:</p>
+    
+    <h2>🎯 For Telegram Music Bot:</h2>
+    <p>Use <code>/stream?title=Song%20Name&type=url</code> to get direct streaming URL:<br>
+    <pre>{
+  "stream_url": "https://rr2---...",
+  "title": "Song Name",
+  "duration": 210,
+  "format": "m4a"
+}</pre></p>
+    
+    <h2>📝 Examples:</h2>
     <ul>
-        <li>Search: <code>/search?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (audio): <code>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download by Title (audio): <code>/download?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (video): <code>/vdown?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download from Spotify: <code>/download?url=https://open.spotify.com/track/...</code></li>
+        <li>Search: <code>/search?title=Imagine%20Dragons%20Believer</code></li>
+        <li>Download Audio: <code>/download?url=https://youtu.be/...</code></li>
+        <li>Download Video: <code>/vdown?title=Despacito</code></li>
+        <li><strong>Get Stream URL:</strong> <code>/stream?title=Shape%20of%20You&type=url</code></li>
+        <li><strong>Proxy Stream:</strong> <code>/stream/download?title=Blinding%20Lights</code></li>
+        <li>Spotify Support: <code>/download?url=https://open.spotify.com/track/...</code></li>
     </ul>
+    
+    <h3>💡 Telegram Bot Integration:</h3>
+    <pre>
+# In your Telegram music bot:
+async def play_song(query):
+    response = await api.get(f"/stream?title={query}&type=url")
+    data = response.json()
+    stream_url = data["stream_url"]
+    # Use this URL with youtube-dl or ffmpeg to play
+    </pre>
     """
 
 if __name__ == '__main__':
-    port = 5000
-    public_url = ngrok.connect(port, "http")
-    print(f"\n👉  ngrok tunnel: {public_url}\n")
-    app.run(host='0.0.0.0', port=port)
-
-
-
-
+    try:
+        from pyngrok import ngrok
+        port = 5000
+        public_url = ngrok.connect(port, "http")
+        print(f"\n👉  ngrok tunnel: {public_url}\n")
+    except Exception as e:
+        print(f"\n⚠️  ngrok error: {e}")
+        print("Running without ngrok tunnel...\n")
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)
