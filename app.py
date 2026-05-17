@@ -1,198 +1,105 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response
 import yt_dlp
 import requests
 import secrets
 import time
-import os
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
-
-COOKIES_FILE = "cookies.txt"
-
-TOKEN_EXPIRY = 600  # 10 minutes
-
 TOKENS = {}
 
+YDL_OPTS = {
+    "quiet": True,
+    "nocheckcertificate": True,
+    "geo_bypass": True,
+    "noplaylist": True,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"]
+        }
+    },
+}
+
 # =========================
-# TOKEN SYSTEM
+# TOKEN GENERATOR
 # =========================
 
-def cleanup_tokens():
-    now = time.time()
-
-    expired = []
-
-    for token, data in TOKENS.items():
-        if now > data["expires"]:
-            expired.append(token)
-
-    for token in expired:
-        del TOKENS[token]
-
-
-def generate_token():
-    return (
+def generate_token(video_id: str):
+    token = (
         "ShrutiMusic"
         + secrets.token_urlsafe(64)
         + "ShrutiBots"
     )
 
-
-# =========================
-# VIDEO ID
-# =========================
-
-def get_video_id(url):
-    if "v=" in url:
-        return url.split("v=")[-1].split("&")[0]
-
-    if "youtu.be/" in url:
-        return url.split("youtu.be/")[-1].split("?")[0]
-
-    return url
-
-
-# =========================
-# STREAM EXTRACTION
-# =========================
-
-def extract_stream(video_url, media_type="audio"):
-
-    ydl_opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "cookiefile": COOKIES_FILE,
-
-        # IMPORTANT
-        "extractor_args": {
-            "youtube": {
-                "player_client": [
-                    "android",
-                    "web"
-                ]
-            }
-        },
-
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
+    TOKENS[token] = {
+        "video_id": video_id,
+        "time": time.time()
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    return token
 
-        info = ydl.extract_info(
-            video_url,
-            download=False
-        )
 
-        formats = info.get("formats", [])
+def verify_token(video_id: str, token: str):
 
-        # =========================
-        # AUDIO
-        # =========================
+    if token not in TOKENS:
+        return False
 
-        if media_type == "audio":
+    data = TOKENS[token]
 
-            audio_formats = []
+    if data["video_id"] != video_id:
+        return False
 
-            for f in formats:
+    # 10 min expiry
+    if time.time() - data["time"] > 600:
+        del TOKENS[token]
+        return False
 
-                if (
-                    f.get("acodec") != "none"
-                    and f.get("vcodec") == "none"
-                    and f.get("url")
-                ):
-
-                    audio_formats.append(f)
-
-            if not audio_formats:
-                raise Exception(
-                    "No audio stream found"
-                )
-
-            # Prefer m4a
-            audio_formats.sort(
-                key=lambda x: (
-                    x.get("ext") != "m4a",
-                    -(x.get("abr") or 0)
-                )
-            )
-
-            best = audio_formats[0]
-
-        # =========================
-        # VIDEO
-        # =========================
-
-        else:
-
-            video_formats = []
-
-            for f in formats:
-
-                if (
-                    f.get("vcodec") != "none"
-                    and f.get("acodec") != "none"
-                    and f.get("height")
-                    and f.get("height") <= 360
-                    and f.get("url")
-                ):
-
-                    video_formats.append(f)
-
-            if not video_formats:
-                raise Exception(
-                    "No video stream found"
-                )
-
-            video_formats.sort(
-                key=lambda x: (
-                    -(x.get("height") or 0)
-                )
-            )
-
-            best = video_formats[0]
-
-        return {
-
-            "stream_url": best["url"],
-
-            "title": info.get("title"),
-
-            "duration": info.get("duration"),
-
-            "thumbnail": info.get("thumbnail"),
-
-            "video_id": info.get("id"),
-
-            "format": best.get("ext"),
-
-            "filesize": best.get("filesize"),
-
-            "quality": media_type,
-        }
+    return True
 
 
 # =========================
-# HOME
+# SEARCH
 # =========================
 
-@app.route("/")
-def home():
+@app.route("/search")
+def search():
 
-    return jsonify({
+    title = request.args.get("title")
 
-        "status": "running",
+    if not title:
+        return jsonify({
+            "error": "title required"
+        }), 400
 
-        "service": "Shruti Style Stream API",
+    try:
 
-        "developer": "Custom"
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
 
-    })
+            info = ydl.extract_info(
+                f"ytsearch1:{title}",
+                download=False
+            )
+
+        if not info or not info.get("entries"):
+            return jsonify({
+                "error": "No results"
+            }), 404
+
+        data = info["entries"][0]
+
+        return jsonify({
+            "title": data.get("title"),
+            "url": f"https://youtube.com/watch?v={data.get('id')}",
+            "duration": data.get("duration"),
+            "video_id": data.get("id"),
+            "thumbnail": data.get("thumbnail")
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 
 # =========================
@@ -202,58 +109,52 @@ def home():
 @app.route("/download")
 def download():
 
-    cleanup_tokens()
-
     video_url = request.args.get("url")
-
-    media_type = request.args.get(
+    file_type = request.args.get(
         "type",
         "audio"
     )
 
     if not video_url:
-
         return jsonify({
-
-            "error": "url parameter required"
-
+            "error": "url required"
         }), 400
 
     try:
 
-        video_id = get_video_id(video_url)
+        if "youtube.com" in video_url:
+            video_id = (
+                video_url.split("v=")[-1]
+                .split("&")[0]
+            )
 
-        token = generate_token()
+        elif "youtu.be" in video_url:
+            video_id = (
+                video_url.split("/")[-1]
+                .split("?")[0]
+            )
 
-        TOKENS[token] = {
+        else:
+            video_id = video_url
 
-            "video_url": video_url,
-
-            "type": media_type,
-
-            "expires": time.time()
-            + TOKEN_EXPIRY,
-        }
+        token = generate_token(video_id)
 
         return jsonify({
-
             "status": "success",
-
             "video_id": video_id,
-
             "download_token": token,
-
-            "usage":
-            "Use token in X-Download-Token header"
-
+            "type": file_type,
+            "usage": (
+                "Use token in "
+                "/stream/<video_id>?"
+                "type=audio&token=TOKEN"
+            )
         })
 
     except Exception as e:
 
         return jsonify({
-
             "error": str(e)
-
         }), 500
 
 
@@ -264,184 +165,176 @@ def download():
 @app.route("/stream/<video_id>")
 def stream(video_id):
 
-    cleanup_tokens()
-
-    token = request.headers.get(
-        "X-Download-Token"
+    file_type = request.args.get(
+        "type",
+        "audio"
     )
+
+    token = request.args.get("token")
 
     if not token:
-
         return jsonify({
-
-            "error":
-            "Missing X-Download-Token"
-
+            "error": "token required"
         }), 403
 
-    if token not in TOKENS:
-
+    if not verify_token(video_id, token):
         return jsonify({
-
-            "error": "Invalid token"
-
+            "error": "invalid token"
         }), 403
-
-    token_data = TOKENS[token]
-
-    if time.time() > token_data["expires"]:
-
-        del TOKENS[token]
-
-        return jsonify({
-
-            "error": "Token expired"
-
-        }), 403
-
-    video_url = token_data["video_url"]
-
-    media_type = request.args.get(
-        "type",
-        token_data["type"]
-    )
 
     try:
 
-        stream_info = extract_stream(
-            video_url,
-            media_type
+        youtube_url = (
+            f"https://youtube.com/watch?v="
+            f"{video_id}"
         )
 
-        youtube_stream_url = (
-            stream_info["stream_url"]
-        )
-
-        headers = {
-
-            "User-Agent":
-            (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36"
-            ),
-
-            "Referer":
-            "https://www.youtube.com/"
+        ydl_opts = {
+            **YDL_OPTS
         }
 
-        # =========================
-        # CHUNK STREAMING
-        # =========================
+        if file_type == "video":
 
-        def generate():
+            ydl_opts["format"] = (
+                "bestvideo[height<=720]+"
+                "bestaudio/"
+                "best"
+            )
 
-            with requests.get(
-                youtube_stream_url,
-                headers=headers,
-                stream=True
-            ) as r:
+        else:
 
-                r.raise_for_status()
+            ydl_opts["format"] = (
+                "bestaudio/"
+                "best"
+            )
 
-                for chunk in r.iter_content(
-                    chunk_size=16384
-                ):
+        with yt_dlp.YoutubeDL(
+            ydl_opts
+        ) as ydl:
 
-                    if chunk:
-                        yield chunk
+            info = ydl.extract_info(
+                youtube_url,
+                download=False
+            )
+
+        stream_url = None
+
+        if info.get("url"):
+
+            stream_url = info["url"]
+
+        else:
+
+            formats = info.get(
+                "formats",
+                []
+            )
+
+            for fmt in formats:
+
+                if file_type == "audio":
+
+                    if (
+                        fmt.get("acodec") != "none"
+                        and
+                        fmt.get("url")
+                    ):
+
+                        stream_url = fmt["url"]
+                        break
+
+                else:
+
+                    if (
+                        fmt.get("vcodec") != "none"
+                        and
+                        fmt.get("url")
+                    ):
+
+                        stream_url = fmt["url"]
+                        break
+
+        if not stream_url:
+
+            return jsonify({
+                "error": "No stream found"
+            }), 404
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0"
+            ),
+            "Referer": (
+                "https://youtube.com/"
+            )
+        }
+
+        r = requests.get(
+            stream_url,
+            headers=headers,
+            stream=True
+        )
 
         content_type = (
-
-            "audio/mp4"
-
-            if media_type == "audio"
-
-            else "video/mp4"
+            "video/mp4"
+            if file_type == "video"
+            else "audio/mp4"
         )
 
         return Response(
-
-            stream_with_context(
-                generate()
+            r.iter_content(
+                chunk_size=1024 * 64
             ),
-
+            content_type=content_type,
             headers={
-
-                "Content-Type":
-                content_type,
-
-                "Content-Disposition":
-                (
-                    f'inline; filename="{video_id}"'
-                )
+                "Accept-Ranges": "bytes"
             }
         )
 
     except Exception as e:
 
         return jsonify({
-
             "error": str(e)
-
         }), 500
 
 
 # =========================
-# INFO
+# HOME
 # =========================
 
-@app.route("/info")
-def info():
+@app.route("/")
+def home():
 
-    video_url = request.args.get("url")
+    return """
+    <h1>YouTube API Running</h1>
 
-    media_type = request.args.get(
-        "type",
-        "audio"
-    )
+    <h3>Search</h3>
+    <pre>/search?title=believer</pre>
 
-    if not video_url:
+    <h3>Get Token</h3>
+    <pre>/download?url=dQw4w9WgXcQ&type=audio</pre>
 
-        return jsonify({
-
-            "error":
-            "url parameter required"
-
-        }), 400
-
-    try:
-
-        data = extract_stream(
-            video_url,
-            media_type
-        )
-
-        return jsonify({
-
-            "status": "success",
-
-            **data
-        })
-
-    except Exception as e:
-
-        return jsonify({
-
-            "error": str(e)
-
-        }), 500
+    <h3>Stream</h3>
+    <pre>
+/stream/dQw4w9WgXcQ?type=audio&token=TOKEN
+    </pre>
+    """
 
 
 # =========================
-# RUN
+# START
 # =========================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get("PORT", 5000)
-    )
+    port = 5000
+
+    import os
+
+    if os.environ.get("PORT"):
+        port = int(
+            os.environ.get("PORT")
+        )
 
     app.run(
         host="0.0.0.0",
