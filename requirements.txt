@@ -1,0 +1,6 @@
+Flask==2.3.2
+yt-dlp
+requests
+pyngrok
+gunicorn==21.2.0
+flask[async]
