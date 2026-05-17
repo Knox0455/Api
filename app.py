@@ -1,288 +1,421 @@
+# app.py
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import yt_dlp
 import os
+import re
 import uuid
-import requests
 import hashlib
-import glob
-import shutil
-from pyngrok import ngrok
+import json
+import requests
+from datetime import datetime, timedelta
+from functools import wraps
+import redis
+from dotenv import load_dotenv
 
+load_dotenv()
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all domains
 
-# Base directory using /tmp (Render free plan uses ephemeral storage)
-BASE_TEMP_DIR = "/tmp"
+# ============ CONFIGURATION ============
+class Config:
+    # Directories
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+    CACHE_DIR = os.path.join(BASE_DIR, "cache")
+    
+    # Create directories
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    
+    # Cache settings (7 days TTL)
+    CACHE_TTL = 604800  # 7 days in seconds
+    MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB max
+    
+    # Rate limiting
+    RATELIMIT_REQUESTS = 100
+    RATELIMIT_PERIOD = 60  # seconds
+    
+    # Redis (optional, for production)
+    REDIS_URL = os.getenv("REDIS_URL", None)
+    
+    # YouTube cookies (optional, for age-restricted content)
+    COOKIES_FILE = os.getenv("COOKIES_FILE", None)
+    
+    # Allowed formats
+    ALLOWED_AUDIO_FORMATS = ['mp3', 'm4a', 'webm', 'opus']
+    ALLOWED_VIDEO_FORMATS = ['mp4', 'mkv', 'webm']
 
-# Directory for storing temporary download files (will be cleared after each request)
-TEMP_DOWNLOAD_DIR = os.path.join(BASE_TEMP_DIR, "download")
-os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
+config = Config()
 
-# Directory for storing cached audio files (persists until container restart)
-CACHE_DIR = os.path.join(BASE_TEMP_DIR, "cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
+# ============ HELPER FUNCTIONS ============
+def get_cache_key(url, media_type, quality=None):
+    """Generate unique cache key"""
+    key_data = f"{url}_{media_type}_{quality or ''}"
+    return hashlib.md5(key_data.encode()).hexdigest()
 
-# Directory for storing cached video files separately
-CACHE_VIDEO_DIR = os.path.join(BASE_TEMP_DIR, "cache_video")
-os.makedirs(CACHE_VIDEO_DIR, exist_ok=True)
-
-# Maximum cache size in bytes (adjusted to 500MB for Render free plan)
-MAX_CACHE_SIZE = 500 * 1024 * 1024  # 500MB
-
-# Path to your cookies file (if needed)
-COOKIES_FILE = "cookies.txt"  # Replace with your actual cookies file path if required
-
-# Search API URL (used both for regular searches and Spotify link resolution)
-SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search?title="
-
-def get_cache_key(video_url):
-    """Generate a cache key from the video URL."""
-    return hashlib.md5(video_url.encode('utf-8')).hexdigest()
-
-def get_directory_size(directory):
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(directory):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.isfile(fp):
-                total_size += os.path.getsize(fp)
-    return total_size
-
-def check_cache_size_and_cleanup():
-    """Check combined cache size and remove all cache files if it exceeds the threshold."""
-    total_size = get_directory_size(CACHE_DIR) + get_directory_size(CACHE_VIDEO_DIR)
-    if total_size > MAX_CACHE_SIZE:
-        for cache_dir in [CACHE_DIR, CACHE_VIDEO_DIR]:
-            for file in os.listdir(cache_dir):
-                file_path = os.path.join(cache_dir, file)
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    print(f"Error deleting file {file_path}: {e}")
-
-def download_audio(video_url):
-    """
-    Download audio from the given YouTube video URL with caching.
-    If the audio file was previously downloaded, return the cached file.
-    """
-    cache_key = get_cache_key(video_url)
-    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
-    if cached_files:
-        return cached_files[0]
-
-    unique_id = str(uuid.uuid4())
-    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = {
-        'format': 'worstaudio/worst',
-        'outtmpl': output_template,
-        'noplaylist': True,
-        'quiet': True,
-        'cookiefile': COOKIES_FILE,
-        'socket_timeout': 60,
-        'max_memory': 450000,
+def get_file_extension(format_spec):
+    """Get file extension from yt-dlp format"""
+    ext_map = {
+        'mp3': 'mp3',
+        'm4a': 'm4a', 
+        'opus': 'opus',
+        'webm': 'webm',
+        'mp4': 'mp4',
+        'mkv': 'mkv'
     }
+    return ext_map.get(format_spec, 'mp4' if 'video' in format_spec else 'mp3')
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+def cleanup_old_files():
+    """Clean files older than 7 days"""
+    try:
+        cutoff = datetime.now() - timedelta(days=7)
+        for dir_path in [config.DOWNLOAD_DIR, config.CACHE_DIR]:
+            for filename in os.listdir(dir_path):
+                filepath = os.path.join(dir_path, filename)
+                if os.path.isfile(filepath):
+                    mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                    if mtime < cutoff:
+                        os.remove(filepath)
+                        print(f"Cleaned up: {filepath}")
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+
+# ============ YOUTUBE DOWNLOADER ============
+class YouTubeDownloader:
+    @staticmethod
+    def extract_info(url):
+        """Extract video information without downloading"""
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+            ydl_opts['cookiefile'] = config.COOKIES_FILE
+        
         try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            ext = info.get("ext", "m4a")
-            cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
-            shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()  # Check cache size after adding a new file
-            return cached_file_path
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                
+                # Format duration
+                duration = info.get('duration', 0)
+                if duration:
+                    minutes = duration // 60
+                    seconds = duration % 60
+                    duration_str = f"{minutes}:{seconds:02d}"
+                else:
+                    duration_str = "LIVE"
+                
+                # Get best thumbnail
+                thumbnails = info.get('thumbnails', [])
+                thumbnail = thumbnails[-1]['url'] if thumbnails else None
+                
+                return {
+                    'success': True,
+                    'id': info.get('id'),
+                    'title': info.get('title'),
+                    'duration': duration_str,
+                    'duration_seconds': duration,
+                    'thumbnail': thumbnail,
+                    'channel': info.get('uploader'),
+                    'channel_id': info.get('channel_id'),
+                    'view_count': info.get('view_count'),
+                    'like_count': info.get('like_count'),
+                    'is_live': info.get('is_live', False)
+                }
         except Exception as e:
-            raise Exception(f"Error downloading audio: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    @staticmethod
+    def download_audio(url, quality='best'):
+        """Download audio only"""
+        cache_key = get_cache_key(url, 'audio', quality)
+        
+        # Check cache
+        cached_files = [f for f in os.listdir(config.CACHE_DIR) if f.startswith(cache_key)]
+        if cached_files:
+            return os.path.join(config.CACHE_DIR, cached_files[0])
+        
+        # Audio format options
+        format_map = {
+            'best': 'bestaudio/best',
+            'high': 'bestaudio[abr>128]/bestaudio',
+            'medium': 'bestaudio[abr>=64]/bestaudio',
+            'low': 'worstaudio/worst'
+        }
+        
+        filename = f"{uuid.uuid4().hex}.%(ext)s"
+        output_path = os.path.join(config.DOWNLOAD_DIR, filename)
+        
+        ydl_opts = {
+            'format': format_map.get(quality, 'bestaudio/best'),
+            'outtmpl': output_path,
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_audio': True,
+            'audio_format': 'mp3',
+            'audio_quality': '192',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        }
+        
+        if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+            ydl_opts['cookiefile'] = config.COOKIES_FILE
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+                
+                # Find downloaded file
+                downloaded_file = None
+                for file in os.listdir(config.DOWNLOAD_DIR):
+                    if file.startswith(uuid.uuid4().hex[:8]):
+                        downloaded_file = os.path.join(config.DOWNLOAD_DIR, file)
+                        break
+                
+                if downloaded_file:
+                    # Move to cache
+                    cache_file = os.path.join(config.CACHE_DIR, f"{cache_key}.mp3")
+                    os.rename(downloaded_file, cache_file)
+                    
+                    # Cleanup old files
+                    cleanup_old_files()
+                    
+                    return cache_file
+                
+                return None
+                
+        except Exception as e:
+            raise Exception(f"Audio download failed: {str(e)}")
+    
+    @staticmethod
+    def download_video(url, quality='360'):
+        """Download video with specific quality"""
+        cache_key = get_cache_key(url, 'video', quality)
+        
+        # Check cache
+        cached_files = [f for f in os.listdir(config.CACHE_DIR) if f.startswith(cache_key)]
+        if cached_files:
+            return os.path.join(config.CACHE_DIR, cached_files[0])
+        
+        # Quality presets
+        quality_map = {
+            '144': 'bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/best[height<=144][ext=mp4]',
+            '240': 'bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/best[height<=240][ext=mp4]',
+            '360': 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]',
+            '480': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]',
+            '720': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]',
+            '1080': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]',
+        }
+        
+        format_spec = quality_map.get(quality, quality_map['360'])
+        filename = f"{uuid.uuid4().hex}.%(ext)s"
+        output_path = os.path.join(config.DOWNLOAD_DIR, filename)
+        
+        ydl_opts = {
+            'format': format_spec,
+            'outtmpl': output_path,
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'merge_output_format': 'mp4',
+        }
+        
+        if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+            ydl_opts['cookiefile'] = config.COOKIES_FILE
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+                
+                # Find downloaded file
+                downloaded_file = None
+                for file in os.listdir(config.DOWNLOAD_DIR):
+                    if file.startswith(uuid.uuid4().hex[:8]):
+                        downloaded_file = os.path.join(config.DOWNLOAD_DIR, file)
+                        break
+                
+                if downloaded_file:
+                    # Move to cache
+                    cache_file = os.path.join(config.CACHE_DIR, f"{cache_key}.mp4")
+                    os.rename(downloaded_file, cache_file)
+                    
+                    cleanup_old_files()
+                    return cache_file
+                
+                return None
+                
+        except Exception as e:
+            raise Exception(f"Video download failed: {str(e)}")
 
-def resolve_spotify_link(url):
-    """
-    If the URL is a Spotify link, use the search API to find the corresponding YouTube link.
-    Otherwise, return the URL unchanged.
-    """
-    if "spotify.com" in url:
-        response = requests.get(SEARCH_API_URL + url)
-        if response.status_code != 200:
-            raise Exception("Failed to fetch search results for the Spotify link")
-        search_result = response.json()
-        if not search_result or 'link' not in search_result:
-            raise Exception("No YouTube link found for the given Spotify link")
-        return search_result['link']
-    return url
+downloader = YouTubeDownloader()
+
+# ============ API ENDPOINTS ============
+@app.route('/info', methods=['GET'])
+def get_info():
+    """Get video information"""
+    url = request.args.get('url')
+    
+    if not url:
+        return jsonify({'error': 'URL parameter required'}), 400
+    
+    result = downloader.extract_info(url)
+    return jsonify(result)
 
 @app.route('/search', methods=['GET'])
-def search_video():
-    """
-    Search for a YouTube video using the external API.
-    """
-    try:
-        query = request.args.get('title')
-        if not query:
-            return jsonify({"error": "The 'title' parameter is required"}), 400
-
-        response = requests.get(SEARCH_API_URL + query)
-        if response.status_code != 200:
-            return jsonify({"error": "Failed to fetch search results"}), 500
-
-        search_result = response.json()
-        if not search_result or 'link' not in search_result:
-            return jsonify({"error": "No videos found for the given query"}), 404
-
-        return jsonify({
-            "title": search_result["title"],
-            "url": search_result["link"],
-            "duration": search_result.get("duration"),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-def download_video(video_url):
-    """
-    Download video (with audio) from the given YouTube video URL in 240p and worst audio quality with caching.
-    If the video file was previously downloaded, return the cached file.
-    """
-    cache_key = hashlib.md5((video_url + "_video").encode('utf-8')).hexdigest()
-    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.*"))
-    if cached_files:
-        return cached_files[0]
-
-    unique_id = str(uuid.uuid4())
-    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+def search():
+    """Search YouTube videos"""
+    query = request.args.get('q')
+    limit = int(request.args.get('limit', 5))
+    
+    if not query:
+        return jsonify({'error': 'Search query required'}), 400
+    
     ydl_opts = {
-        'format': 'bestvideo[height<=144]+worstaudio/worst',
-        'outtmpl': output_template,
-        'noplaylist': True,
         'quiet': True,
-        'cookiefile': COOKIES_FILE,
-        'socket_timeout': 60,
-        'max_memory': 300000,
-        'merge_output_format': 'mp4',
+        'no_warnings': True,
+        'extract_flat': True,
+        'default_search': f'ytsearch{limit}',
     }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
-            shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()  # Check cache size after adding a new file
-            return cached_file_path
-        except Exception as e:
-            raise Exception(f"Error downloading video: {e}")
-
-@app.route('/vdown', methods=['GET'])
-def download_video_endpoint():
-    """
-    Download video from a YouTube video URL (or search by title) in 240p with worst audio.
-    Works similarly to the /download endpoint, but returns the video file.
-    """
+    
     try:
-        video_url = request.args.get('url')
-        video_title = request.args.get('title')
-
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
-
-        if video_title and not video_url:
-            response = requests.get(SEARCH_API_URL + video_title)
-            if response.status_code != 200:
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = response.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
-
-        if video_url and "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-
-        cached_file_path = download_video(video_url)
-
-        return send_file(
-            cached_file_path,
-            as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
-        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            search_query = f"ytsearch{limit}:{query}"
+            info = ydl.extract_info(search_query, download=False)
+            
+            results = []
+            if info and 'entries' in info:
+                for entry in info['entries']:
+                    duration = entry.get('duration', 0)
+                    if duration:
+                        minutes = duration // 60
+                        seconds = duration % 60
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "LIVE"
+                    
+                    results.append({
+                        'id': entry.get('id'),
+                        'title': entry.get('title'),
+                        'duration': duration_str,
+                        'url': f"https://youtube.com/watch?v={entry.get('id')}",
+                        'thumbnail': f"https://img.youtube.com/vi/{entry.get('id')}/hqdefault.jpg",
+                        'channel': entry.get('uploader')
+                    })
+            
+            return jsonify({'results': results, 'count': len(results)})
+            
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        # Clean up temporary download files only (not the caches)
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
-            try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                print(f"Error deleting file {file_path}: {cleanup_error}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/download', methods=['GET'])
-def download_audio_endpoint():
-    """
-    Download audio from a YouTube video URL or search for it by title and download.
-    Utilizes caching so repeated downloads for the same video are avoided.
-    Also supports Spotify links by resolving them via the search API.
-    """
+@app.route('/download/audio', methods=['GET'])
+def download_audio():
+    """Download audio only"""
+    url = request.args.get('url')
+    quality = request.args.get('quality', 'best')
+    
+    if not url:
+        return jsonify({'error': 'URL parameter required'}), 400
+    
     try:
-        video_url = request.args.get('url')
-        video_title = request.args.get('title')
-
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
-
-        if video_title and not video_url:
-            response = requests.get(SEARCH_API_URL + video_title)
-            if response.status_code != 200:
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = response.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
-
-        if video_url and "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-
-        cached_file_path = download_audio(video_url)
-
-        return send_file(
-            cached_file_path,
-            as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
-        )
+        # Get video info first
+        info = downloader.extract_info(url)
+        if not info.get('success'):
+            return jsonify({'error': info.get('error')}), 400
+        
+        # Download audio
+        audio_file = downloader.download_audio(url, quality)
+        
+        if audio_file and os.path.exists(audio_file):
+            return send_file(
+                audio_file,
+                as_attachment=True,
+                download_name=f"{info['title'][:50]}.mp3",
+                mimetype='audio/mpeg'
+            )
+        else:
+            return jsonify({'error': 'Download failed'}), 500
+            
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        # Clean up temporary download files only (not the caches)
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
-            try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                print(f"Error deleting file {file_path}: {cleanup_error}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/')
+@app.route('/download/video', methods=['GET'])
+def download_video():
+    """Download video"""
+    url = request.args.get('url')
+    quality = request.args.get('quality', '360')
+    
+    if not url:
+        return jsonify({'error': 'URL parameter required'}), 400
+    
+    try:
+        # Get video info
+        info = downloader.extract_info(url)
+        if not info.get('success'):
+            return jsonify({'error': info.get('error')}), 400
+        
+        # Download video
+        video_file = downloader.download_video(url, quality)
+        
+        if video_file and os.path.exists(video_file):
+            return send_file(
+                video_file,
+                as_attachment=True,
+                download_name=f"{info['title'][:50]}.mp4",
+                mimetype='video/mp4'
+            )
+        else:
+            return jsonify({'error': 'Download failed'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'cache_size': len(os.listdir(config.CACHE_DIR))
+    })
+
+@app.route('/', methods=['GET'])
 def home():
-    return """
-    <h1>🎶 YouTube Audio Downloader API</h1>
-    <p>Use this API to search and download audio from YouTube videos.</p>
-    <p><strong>Endpoints:</strong></p>
-    <ul>
-        <li><strong>/search</strong>: Search for a video by title. Query parameter: <code>?title=</code></li>
-        <li><strong>/download</strong>: Download audio by URL or search for a title and download. Query parameters: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/vdown</strong>: Download video (240p + worst audio) by URL or search for a title and download.</li>
-    </ul>
-    <p>Examples:</p>
-    <ul>
-        <li>Search: <code>/search?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (audio): <code>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download by Title (audio): <code>/download?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (video): <code>/vdown?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download from Spotify: <code>/download?url=https://open.spotify.com/track/...</code></li>
-    </ul>
-    """
+    """API documentation"""
+    return jsonify({
+        'name': 'YouTube Downloader API',
+        'version': '2.0.0',
+        'endpoints': {
+            '/info': 'GET - Get video information (params: url)',
+            '/search': 'GET - Search videos (params: q, limit)',
+            '/download/audio': 'GET - Download audio (params: url, quality)',
+            '/download/video': 'GET - Download video (params: url, quality)',
+            '/health': 'GET - Health check'
+        },
+        'qualities': {
+            'audio': ['best', 'high', 'medium', 'low'],
+            'video': ['144', '240', '360', '480', '720', '1080']
+        }
+    })
 
 if __name__ == '__main__':
-    port = 5000
-    public_url = ngrok.connect(port, "http")
-    print(f"\n👉  ngrok tunnel: {public_url}\n")
-    app.run(host='0.0.0.0', port=port)
-
-
-
-
+    port = int(os.getenv('PORT', 5000))
+    host = os.getenv('HOST', '0.0.0.0')
+    
+    print("""
+    ╔═══════════════════════════════════════╗
+    ║   YouTube Downloader API Started      ║
+    ╠═══════════════════════════════════════╣
+    ║   Server: http://{}:{}     ║
+    ║   Status: Running                       ║
+    ╚═══════════════════════════════════════╝
+    """.format(host if host != '0.0.0.0' else 'localhost', port))
+    
+    app.run(host=host, port=port, debug=False, threaded=True)
